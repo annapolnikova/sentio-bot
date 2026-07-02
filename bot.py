@@ -11,6 +11,7 @@ Sentio Test Group Bot
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -78,6 +79,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             telegram_id INTEGER,
             response_date TEXT,
+            rollon_product TEXT,
             state_change TEXT,
             feelings TEXT,
             effect_time TEXT,
@@ -94,6 +96,13 @@ def init_db():
     )
     conn.commit()
     conn.close()
+    # На випадок, якщо база вже існувала без колонки rollon_product (оновлення бота)
+    conn = db()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(responses)").fetchall()]
+    if "rollon_product" not in cols:
+        conn.execute("ALTER TABLE responses ADD COLUMN rollon_product TEXT")
+        conn.commit()
+    conn.close()
 
 
 def user_exists(telegram_id: int) -> bool:
@@ -105,7 +114,19 @@ def user_exists(telegram_id: int) -> bool:
     return row is not None
 
 
+def get_user(telegram_id: int):
+    conn = db()
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def save_user(data: dict):
+    existing = get_user(data["telegram_id"])
+    registered_at = existing["registered_at"] if existing else datetime.now(TIMEZONE).isoformat()
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO users
@@ -119,7 +140,7 @@ def save_user(data: dict):
             data["phone"],
             data["age_group"],
             data["rollon"],
-            datetime.now(TIMEZONE).isoformat(),
+            registered_at,
         ),
     )
     conn.commit()
@@ -133,29 +154,38 @@ def all_user_ids():
     return [r[0] for r in rows]
 
 
-def already_responded_today(telegram_id: int) -> bool:
+def already_responded_today(telegram_id: int, product: str) -> bool:
     today = datetime.now(TIMEZONE).date().isoformat()
     conn = db()
     row = conn.execute(
-        "SELECT 1 FROM responses WHERE telegram_id = ? AND response_date = ?",
-        (telegram_id, today),
+        "SELECT 1 FROM responses WHERE telegram_id = ? AND response_date = ? AND rollon_product = ?",
+        (telegram_id, today, product),
     ).fetchone()
     conn.close()
     return row is not None
 
 
-def save_response(telegram_id: int, answers: dict):
+def has_pending_products_today(telegram_id: int) -> bool:
+    user = get_user(telegram_id)
+    if not user:
+        return False
+    products = ROLLON_TO_PRODUCTS.get(user.get("rollon"), ["RESET"])
+    return any(not already_responded_today(telegram_id, p) for p in products)
+
+
+def save_response(telegram_id: int, product: str, answers: dict):
     conn = db()
     today = datetime.now(TIMEZONE).date().isoformat()
     conn.execute(
         """INSERT INTO responses
-           (telegram_id, response_date, state_change, feelings, effect_time,
+           (telegram_id, response_date, rollon_product, state_change, feelings, effect_time,
             aroma_rating, usage_freq, experience_text, will_continue, consent,
             instagram, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             telegram_id,
             today,
+            product,
             answers.get("state_change", ""),
             answers.get("feelings", ""),
             answers.get("effect_time", ""),
@@ -186,6 +216,20 @@ ROLLON_OPTIONS = [
     "Rest - no rush (сон / розслаблення)",
 ]
 
+ROLLON_TO_PRODUCTS = {
+    "Всі три": ["RESET", "RISE", "REST"],
+    "Reset - no panic (анти-тривога)": ["RESET"],
+    "Rise - no noise / morning (фокус / ясність)": ["RISE"],
+    "Rest - no rush (сон / розслаблення)": ["REST"],
+}
+PRODUCT_LABELS = {
+    "RESET": "Reset – no panic (анти-тривога)",
+    "RISE": "Rise – no noise / morning (фокус / ясність)",
+    "REST": "Rest – no rush (сон / розслаблення)",
+}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+
 
 def kb(options, prefix):
     return InlineKeyboardMarkup(
@@ -193,16 +237,31 @@ def kb(options, prefix):
     )
 
 
+def kb_with_current(options, prefix, current):
+    buttons = []
+    if current and current in options:
+        buttons.append([InlineKeyboardButton(f"✅ Залишити: {current}", callback_data=f"{prefix}:{current}")])
+    buttons += [[InlineKeyboardButton(o, callback_data=f"{prefix}:{o}")] for o in options if o != current]
+    return InlineKeyboardMarkup(buttons)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if user_exists(tg_id):
+        markup = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📝 Заповнити анкету", callback_data="goto_survey")],
+                [InlineKeyboardButton("✏️ Оновити дані реєстрації", callback_data="start_update")],
+            ]
+        )
         await update.message.reply_text(
             "Ти вже зареєстрована в тестовій групі Sentio 🤍\n"
-            "Щодня о 20:00 я нагадаю заповнити анкету. "
-            "Хочеш заповнити зараз? Напиши /survey"
+            "Щодня о 20:00 я нагадаю заповнити анкету.",
+            reply_markup=markup,
         )
         return ConversationHandler.END
 
+    context.user_data["updating"] = False
     await update.message.reply_text(
         "Привіт! 🤍 Це тестова група Sentio.\n"
         "Давай зареєструємось — це займе хвилину.\n\n"
@@ -212,36 +271,84 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return REG_NAME
 
 
+async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    tg_id = update.effective_user.id
+    old = get_user(tg_id) or {}
+    context.user_data["updating"] = True
+    context.user_data["old"] = old
+    await q.edit_message_text("Оновлюємо дані реєстрації.")
+    await q.message.reply_text(
+        f"Поточне ім'я: {old.get('name', '—')}\n"
+        "Введи нове ім'я, або надішли крапку «.», щоб залишити без змін.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return REG_NAME
+
+
 async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("Твій e-mail?")
+    text = update.message.text.strip()
+    old = context.user_data.get("old", {})
+    if context.user_data.get("updating") and text == ".":
+        context.user_data["name"] = old.get("name", "")
+    else:
+        context.user_data["name"] = text
+
+    if context.user_data.get("updating"):
+        await update.message.reply_text(
+            f"Поточний e-mail: {old.get('email', '—')}\n"
+            "Введи новий e-mail, або надішли крапку «.», щоб залишити без змін."
+        )
+    else:
+        await update.message.reply_text("Твій e-mail?")
     return REG_EMAIL
 
 
 async def reg_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["email"] = update.message.text.strip()
-    phone_kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Поділитися номером", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await update.message.reply_text(
-        "Твій телефон? Можеш натиснути кнопку нижче або ввести вручну.",
-        reply_markup=phone_kb,
-    )
+    text = update.message.text.strip()
+    old = context.user_data.get("old", {})
+    if context.user_data.get("updating") and text == ".":
+        context.user_data["email"] = old.get("email", "")
+    else:
+        if not EMAIL_RE.match(text):
+            await update.message.reply_text(
+                "Схоже, це не e-mail 🤔 Приклад правильного формату: name@example.com\n"
+                "Спробуй ще раз:"
+            )
+            return REG_EMAIL
+        context.user_data["email"] = text
+
+    phone_kb_buttons = [[KeyboardButton("📱 Поділитися номером", request_contact=True)]]
+    phone_kb = ReplyKeyboardMarkup(phone_kb_buttons, resize_keyboard=True, one_time_keyboard=True)
+    if context.user_data.get("updating"):
+        await update.message.reply_text(
+            f"Поточний телефон: {old.get('phone', '—')}\n"
+            "Надішли новий (кнопкою або текстом), або крапку «.», щоб залишити без змін.",
+            reply_markup=phone_kb,
+        )
+    else:
+        await update.message.reply_text(
+            "Твій телефон? Можеш натиснути кнопку нижче або ввести вручну.",
+            reply_markup=phone_kb,
+        )
     return REG_PHONE
 
 
 async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    old = context.user_data.get("old", {})
     if update.message.contact:
         context.user_data["phone"] = update.message.contact.phone_number
     else:
-        context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Твій вік?",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await update.message.reply_text("Обери варіант:", reply_markup=kb(AGE_OPTIONS, "age"))
+        text = update.message.text.strip()
+        if context.user_data.get("updating") and text == ".":
+            context.user_data["phone"] = old.get("phone", "")
+        else:
+            context.user_data["phone"] = text
+
+    await update.message.reply_text("Твій вік?", reply_markup=ReplyKeyboardRemove())
+    age_kb = kb_with_current(AGE_OPTIONS, "age", old.get("age_group")) if context.user_data.get("updating") else kb(AGE_OPTIONS, "age")
+    await update.message.reply_text("Обери варіант:", reply_markup=age_kb)
     return REG_AGE
 
 
@@ -250,9 +357,9 @@ async def reg_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     context.user_data["age_group"] = q.data.split(":", 1)[1]
     await q.edit_message_text(f"Вік: {context.user_data['age_group']}")
-    await q.message.reply_text(
-        "Який рол-он ти тестуєш?", reply_markup=kb(ROLLON_OPTIONS, "rollon")
-    )
+    old = context.user_data.get("old", {})
+    rollon_kb = kb_with_current(ROLLON_OPTIONS, "rollon", old.get("rollon")) if context.user_data.get("updating") else kb(ROLLON_OPTIONS, "rollon")
+    await q.message.reply_text("Який рол-он ти тестуєш?", reply_markup=rollon_kb)
     return REG_ROLLON
 
 
@@ -262,17 +369,27 @@ async def reg_rollon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["rollon"] = q.data.split(":", 1)[1]
     await q.edit_message_text(f"Рол-он: {context.user_data['rollon']}")
 
-    data = dict(context.user_data)
-    data["telegram_id"] = update.effective_user.id
-    data["username"] = update.effective_user.username or ""
+    data = {
+        "telegram_id": update.effective_user.id,
+        "username": update.effective_user.username or "",
+        "name": context.user_data["name"],
+        "email": context.user_data["email"],
+        "phone": context.user_data["phone"],
+        "age_group": context.user_data["age_group"],
+        "rollon": context.user_data["rollon"],
+    }
     save_user(data)
+    was_updating = context.user_data.get("updating")
 
-    await q.message.reply_text(
-        "Дякуємо, реєстрацію завершено! 🤍\n"
-        f"Щодня о {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} я надсилатиму коротку анкету "
-        "про твої відчуття від рол-она. Це займе 1-2 хвилини.\n\n"
-        "Можеш заповнити першу анкету прямо зараз командою /survey"
-    )
+    if was_updating:
+        await q.message.reply_text("Дані оновлено! 🤍 Можеш заповнити анкету командою /survey")
+    else:
+        await q.message.reply_text(
+            "Дякуємо, реєстрацію завершено! 🤍\n"
+            f"Щодня о {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} я надсилатиму коротку анкету "
+            "про твої відчуття від рол-она. Це займе 1-2 хвилини.\n\n"
+            "Можеш заповнити першу анкету прямо зараз командою /survey"
+        )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -284,7 +401,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 registration_conv = ConversationHandler(
-    entry_points=[CommandHandler("start", start)],
+    entry_points=[
+        CommandHandler("start", start),
+        CallbackQueryHandler(start_update, pattern=r"^start_update$"),
+    ],
     states={
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
         REG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_email)],
@@ -330,17 +450,27 @@ CONSENT_OPTIONS = ["так", "так, без імені", "ні"]
 
 async def survey_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
-    if not user_exists(tg_id):
-        await update.message.reply_text(
-            "Спочатку потрібно зареєструватись — напиши /start"
-        )
-        return ConversationHandler.END
-    context.user_data["survey"] = {"feelings": []}
+    user = get_user(tg_id)
     target = update.message or update.callback_query.message
     if update.callback_query:
         await update.callback_query.answer()
+    if not user:
+        await target.reply_text("Спочатку потрібно зареєструватись — напиши /start")
+        return ConversationHandler.END
+
+    products = ROLLON_TO_PRODUCTS.get(user.get("rollon"), ["RESET"])
+    remaining = [p for p in products if not already_responded_today(tg_id, p)]
+    if not remaining:
+        await target.reply_text("Ти вже заповнила анкету на сьогодні по всіх продуктах 🤍 Дякуємо!")
+        return ConversationHandler.END
+
+    current = remaining[0]
+    context.user_data["survey"] = {"feelings": [], "product": current}
+    context.user_data["survey_remaining"] = remaining[1:]
+
+    intro = f"📝 Анкета по продукту: {PRODUCT_LABELS[current]}\n\n" if len(products) > 1 else ""
     await target.reply_text(
-        "Як змінився твій стан?", reply_markup=kb(STATE_OPTIONS, "state")
+        intro + "Як змінився твій стан?", reply_markup=kb(STATE_OPTIONS, "state")
     )
     return SUR_STATE
 
@@ -461,10 +591,22 @@ async def sur_instagram_done(update: Update, context: ContextTypes.DEFAULT_TYPE,
     survey = context.user_data["survey"]
     survey["instagram"] = instagram
     survey["feelings"] = ", ".join(survey.get("feelings", []))
-    save_response(update.effective_user.id, survey)
-    await update.message.reply_text(
-        "Дякуємо за відповіді! 🤍 Побачимось завтра."
-    )
+    product = survey.pop("product")
+    save_response(update.effective_user.id, product, survey)
+
+    remaining = context.user_data.get("survey_remaining", [])
+    if remaining:
+        next_product = remaining[0]
+        context.user_data["survey"] = {"feelings": [], "product": next_product}
+        context.user_data["survey_remaining"] = remaining[1:]
+        await update.message.reply_text(
+            f"Дякую! 🤍 Тепер анкета по продукту: {PRODUCT_LABELS[next_product]}\n\n"
+            "Як змінився твій стан?",
+            reply_markup=kb(STATE_OPTIONS, "state"),
+        )
+        return SUR_STATE
+
+    await update.message.reply_text("Дякуємо за відповіді! 🤍 Побачимось завтра.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -480,7 +622,7 @@ async def sur_instagram_skip(update: Update, context: ContextTypes.DEFAULT_TYPE)
 survey_conv = ConversationHandler(
     entry_points=[
         CommandHandler("survey", survey_entry),
-        CallbackQueryHandler(survey_entry, pattern=r"^daily_survey$"),
+        CallbackQueryHandler(survey_entry, pattern=r"^(daily_survey|goto_survey)$"),
     ],
     states={
         SUR_STATE: [CallbackQueryHandler(sur_state, pattern=r"^state:")],
@@ -508,7 +650,7 @@ survey_conv = ConversationHandler(
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
     for tg_id in all_user_ids():
-        if already_responded_today(tg_id):
+        if not has_pending_products_today(tg_id):
             continue
         try:
             markup = InlineKeyboardMarkup(
