@@ -18,6 +18,8 @@ from zoneinfo import ZoneInfo
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
 )
@@ -218,13 +220,28 @@ async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reg_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["email"] = update.message.text.strip()
-    await update.message.reply_text("Твій телефон?")
+    phone_kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поділитися номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "Твій телефон? Можеш натиснути кнопку нижче або ввести вручну.",
+        reply_markup=phone_kb,
+    )
     return REG_PHONE
 
 
 async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("Твій вік?", reply_markup=kb(AGE_OPTIONS, "age"))
+    if update.message.contact:
+        context.user_data["phone"] = update.message.contact.phone_number
+    else:
+        context.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Твій вік?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text("Обери варіант:", reply_markup=kb(AGE_OPTIONS, "age"))
     return REG_AGE
 
 
@@ -271,7 +288,7 @@ registration_conv = ConversationHandler(
     states={
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
         REG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_email)],
-        REG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone)],
+        REG_PHONE: [MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), reg_phone)],
         REG_AGE: [CallbackQueryHandler(reg_age, pattern=r"^age:")],
         REG_ROLLON: [CallbackQueryHandler(reg_rollon, pattern=r"^rollon:")],
     },
