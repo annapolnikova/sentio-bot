@@ -412,7 +412,12 @@ registration_conv = ConversationHandler(
         REG_AGE: [CallbackQueryHandler(reg_age, pattern=r"^age:")],
         REG_ROLLON: [CallbackQueryHandler(reg_rollon, pattern=r"^rollon:")],
     },
-    fallbacks=[CommandHandler("cancel", cancel)],
+    fallbacks=[
+        CommandHandler("cancel", cancel),
+        CommandHandler("start", start),
+        CallbackQueryHandler(start_update, pattern=r"^start_update$"),
+    ],
+    conversation_timeout=7200,
 )
 
 # ---------------------------------------------------------------------------
@@ -641,7 +646,14 @@ survey_conv = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, sur_instagram),
         ],
     },
-    fallbacks=[CommandHandler("cancel", cancel)],
+    fallbacks=[
+        CommandHandler("cancel", cancel),
+        # Якщо людина застрягла на попередньому питанні і тисне кнопку нового
+        # нагадування (або пише /survey ще раз) — просто перезапускаємо анкету.
+        CommandHandler("survey", survey_entry),
+        CallbackQueryHandler(survey_entry, pattern=r"^(daily_survey|goto_survey)$"),
+    ],
+    conversation_timeout=7200,  # 2 години — якщо анкету покинули на півдорозі, стан скидається сам
 )
 
 # ---------------------------------------------------------------------------
