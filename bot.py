@@ -44,6 +44,16 @@ TIMEZONE = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
 REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "20"))
 REMINDER_MINUTE = int(os.environ.get("REMINDER_MINUTE", "0"))
 DB_PATH = os.environ.get("DB_PATH", "sentio.db")
+TEST_PERIOD_DAYS = int(os.environ.get("TEST_PERIOD_DAYS", "14"))
+
+THANK_YOU_MESSAGE = (
+    "Дякуємо, що була з нами ці 14 днів тестування Sentio! 🤍\n\n"
+    "Твої відповіді дуже допомогли нам зробити продукт кращим. "
+    "Анкети більше надсилатись не будуть.\n\n"
+    "Якщо захочеш поділитися ще якимись враженнями — просто напиши нам прямо тут, "
+    "ми завжди раді почути.\n\n"
+    "З любов'ю, команда Sentio 🌿"
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -72,7 +82,8 @@ def init_db():
             phone TEXT,
             age_group TEXT,
             rollon TEXT,
-            registered_at TEXT
+            registered_at TEXT,
+            completed_notified INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS responses (
@@ -103,6 +114,27 @@ def init_db():
         conn.execute("ALTER TABLE responses ADD COLUMN rollon_product TEXT")
         conn.commit()
     conn.close()
+    conn = db()
+    ucols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "completed_notified" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN completed_notified INTEGER DEFAULT 0")
+        conn.commit()
+    conn.close()
+
+
+def days_since_registration(user: dict) -> int:
+    reg_date = datetime.fromisoformat(user["registered_at"]).astimezone(TIMEZONE).date()
+    today = datetime.now(TIMEZONE).date()
+    return (today - reg_date).days
+
+
+def mark_completed_notified(telegram_id: int):
+    conn = db()
+    conn.execute(
+        "UPDATE users SET completed_notified = 1 WHERE telegram_id = ?", (telegram_id,)
+    )
+    conn.commit()
+    conn.close()
 
 
 def user_exists(telegram_id: int) -> bool:
@@ -127,11 +159,12 @@ def get_user(telegram_id: int):
 def save_user(data: dict):
     existing = get_user(data["telegram_id"])
     registered_at = existing["registered_at"] if existing else datetime.now(TIMEZONE).isoformat()
+    completed_notified = existing["completed_notified"] if existing else 0
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO users
-           (telegram_id, username, name, email, phone, age_group, rollon, registered_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           (telegram_id, username, name, email, phone, age_group, rollon, registered_at, completed_notified)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             data["telegram_id"],
             data.get("username", ""),
@@ -141,6 +174,7 @@ def save_user(data: dict):
             data["age_group"],
             data["rollon"],
             registered_at,
+            completed_notified,
         ),
     )
     conn.commit()
@@ -248,6 +282,13 @@ def kb_with_current(options, prefix, current):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     if user_exists(tg_id):
+        user = get_user(tg_id)
+        if days_since_registration(user) >= TEST_PERIOD_DAYS:
+            if not user.get("completed_notified"):
+                mark_completed_notified(tg_id)
+            await update.message.reply_text(THANK_YOU_MESSAGE)
+            return ConversationHandler.END
+
         markup = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("📝 Заповнити анкету", callback_data="goto_survey")],
@@ -463,6 +504,12 @@ async def survey_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await target.reply_text("Спочатку потрібно зареєструватись — напиши /start")
         return ConversationHandler.END
 
+    if days_since_registration(user) >= TEST_PERIOD_DAYS:
+        if not user.get("completed_notified"):
+            mark_completed_notified(tg_id)
+        await target.reply_text(THANK_YOU_MESSAGE)
+        return ConversationHandler.END
+
     products = ROLLON_TO_PRODUCTS.get(user.get("rollon"), ["RESET"])
     remaining = [p for p in products if not already_responded_today(tg_id, p)]
     if not remaining:
@@ -662,6 +709,19 @@ survey_conv = ConversationHandler(
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
     for tg_id in all_user_ids():
+        user = get_user(tg_id)
+        if not user:
+            continue
+
+        if days_since_registration(user) >= TEST_PERIOD_DAYS:
+            if not user.get("completed_notified"):
+                try:
+                    await context.bot.send_message(chat_id=tg_id, text=THANK_YOU_MESSAGE)
+                except Exception as e:
+                    logger.warning("Не вдалось надіслати фінальне повідомлення %s: %s", tg_id, e)
+                mark_completed_notified(tg_id)
+            continue
+
         if not has_pending_products_today(tg_id):
             continue
         try:
