@@ -83,7 +83,8 @@ def init_db():
             age_group TEXT,
             rollon TEXT,
             registered_at TEXT,
-            completed_notified INTEGER DEFAULT 0
+            completed_notified INTEGER DEFAULT 0,
+            last_reminder_date TEXT
         );
 
         CREATE TABLE IF NOT EXISTS responses (
@@ -118,6 +119,9 @@ def init_db():
     ucols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
     if "completed_notified" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN completed_notified INTEGER DEFAULT 0")
+        conn.commit()
+    if "last_reminder_date" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN last_reminder_date TEXT")
         conn.commit()
     conn.close()
 
@@ -160,11 +164,12 @@ def save_user(data: dict):
     existing = get_user(data["telegram_id"])
     registered_at = existing["registered_at"] if existing else datetime.now(TIMEZONE).isoformat()
     completed_notified = existing["completed_notified"] if existing else 0
+    last_reminder_date = existing["last_reminder_date"] if existing else None
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO users
-           (telegram_id, username, name, email, phone, age_group, rollon, registered_at, completed_notified)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (telegram_id, username, name, email, phone, age_group, rollon, registered_at, completed_notified, last_reminder_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             data["telegram_id"],
             data.get("username", ""),
@@ -175,7 +180,18 @@ def save_user(data: dict):
             data["rollon"],
             registered_at,
             completed_notified,
+            last_reminder_date,
         ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_reminder_sent(telegram_id: int):
+    today = datetime.now(TIMEZONE).date().isoformat()
+    conn = db()
+    conn.execute(
+        "UPDATE users SET last_reminder_date = ? WHERE telegram_id = ?", (today, telegram_id)
     )
     conn.commit()
     conn.close()
@@ -708,6 +724,7 @@ survey_conv = ConversationHandler(
 # ---------------------------------------------------------------------------
 
 async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now(TIMEZONE).date().isoformat()
     for tg_id in all_user_ids():
         user = get_user(tg_id)
         if not user:
@@ -722,6 +739,9 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
                 mark_completed_notified(tg_id)
             continue
 
+        if user.get("last_reminder_date") == today:
+            continue  # нагадування вже надсилалось сьогодні (захист від дублів при повторному запуску)
+
         if not has_pending_products_today(tg_id):
             continue
         try:
@@ -733,6 +753,7 @@ async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE):
                 text="Привіт! 🌙 Час поділитись відчуттями від рол-она за сьогодні.",
                 reply_markup=markup,
             )
+            mark_reminder_sent(tg_id)
         except Exception as e:
             logger.warning("Не вдалось надіслати нагадування %s: %s", tg_id, e)
 
@@ -816,6 +837,16 @@ def main():
         send_daily_reminders,
         time=dtime(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=TIMEZONE),
     )
+
+    # "Наздоганяюча" перевірка одразу після старту/передеплою: якщо сервіс
+    # перезапустився вже ПІСЛЯ часу нагадування, а сьогоднішня розсилка ще не
+    # пішла — надсилаємо її зараз, а не чекаємо до завтра.
+    now = datetime.now(TIMEZONE)
+    reminder_time_today = now.replace(
+        hour=REMINDER_HOUR, minute=REMINDER_MINUTE, second=0, microsecond=0
+    )
+    if now >= reminder_time_today:
+        app.job_queue.run_once(send_daily_reminders, when=15)
 
     logger.info("Bot started")
     app.run_polling()
